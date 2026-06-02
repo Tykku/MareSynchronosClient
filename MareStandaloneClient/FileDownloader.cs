@@ -107,12 +107,12 @@ public class FileDownloader
         // Fall back to magic bytes for files not in the local cache
         if (data.Length < 4) return ".bin";
 
-        // Binary-header formats
+        // Binary-header formats (version/flag bytes, not ASCII)
         if (data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x03 && data[3] == 0x01) return ".mtrl"; // 00 00 03 01
-        if (data[0] == 0x06 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) return ".mdl";  // 06 00 00 01
         if (data[0] == 0x01 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) return ".phyb"; // 01 00 00 01
+        if (data[0] is 0x05 or 0x06 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) return ".mdl"; // 05/06 00 00 01
         if (data[0] == 0x1F && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x00) return ".pbd";  // 1F 00 00 00
-        // .tex and .atex share the same magic — can't distinguish from bytes alone, .tex is far more common
+        // .tex and .atex share 00 00 80 00 — .tex is far more common so we prefer it
         if (data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x80 && data[3] == 0x00) return ".tex";  // 00 00 80 00
 
         return Encoding.ASCII.GetString(data[..4]) switch
@@ -124,14 +124,17 @@ public class FileDownloader
             "plks" => ".skp",   // 70 6C 6B 73
             "pap " => ".pap",   // 70 61 70 20
             "TMLB" => ".tmb",   // 54 4D 4C 42
-            "SEDB" => ".scd",   // 53 45 44 42
+            "SEDB" => ".scd",   // 53 45 44 42 (also appears in some .avfx)
+            "DDS " => ".dds",   // 44 44 53 20 (some .atex embed DDS)
+            "\x89PNG" => ".png", // 89 50 4E 47 (some .atex embed PNG)
             _ => ".bin",
         };
     }
 
     private async Task<string?> DownloadOneAsync(DownloadFileDto dto, string outputDir, CancellationToken ct)
     {
-        _logger.LogInformation("{hash}: downloading ({size} bytes compressed)...", dto.Hash, dto.Size);
+        _logger.LogInformation("{hash}: downloading from {url} (munge key: {key}, {size} bytes compressed)",
+            dto.Hash, dto.DirectDownloadUrl, dto.MungeKey ?? "<none>", dto.Size);
 
         // Download compressed bytes — no auth needed for DirectDownloadUrl
         byte[] compressed;
