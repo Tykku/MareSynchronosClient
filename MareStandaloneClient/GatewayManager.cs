@@ -6,7 +6,6 @@ using System.Text.Json;
 
 namespace MareStandaloneClient;
 
-/// <summary>Resolves the best gateway URI for a given service URI.</summary>
 public static class GatewayManager
 {
     private const string GatewaySubDomain = "gateways";

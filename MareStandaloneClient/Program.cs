@@ -1,15 +1,29 @@
 using MareStandaloneClient;
 using Microsoft.Extensions.Logging;
 
+// Usage:
+//   dotnet run
+//   dotnet run -- <hash> [hash ...] / [-o <outputDir>]  -- download specific files by hash
+
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 using var loggerFactory = LoggerFactory.Create(b =>
-    b.AddConsole().SetMinimumLevel(LogLevel.Information));
+    b.AddConsole().SetMinimumLevel(LogLevel.Debug));
 
 var logger = loggerFactory.CreateLogger<Program>();
 
-// --- Load config ---
+List<string> hashes = [];
+string outputDir = "downloads";
+
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i] == "-o" && i + 1 < args.Length)
+        outputDir = args[++i];
+    else
+        hashes.Add(args[i]);
+}
+
 var configDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
     "XIVLauncher", "pluginConfigs", "MareSempiterne");
@@ -29,21 +43,19 @@ try
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Failed to parse serverConfig.json: {ex.Message}");
+    Console.WriteLine($"Failed to parse server.json: {ex.Message}");
     return 1;
 }
 
 if (config.ServerStorage.Count == 0)
 {
-    Console.WriteLine("No servers configured in serverConfig.json.");
+    Console.WriteLine("No servers configured in server.json.");
     return 1;
 }
 
-// --- Pick server ---
 var serverStorage = config.ServerStorage[config.CurrentServer < config.ServerStorage.Count ? config.CurrentServer : 0];
 Console.WriteLine($"Server: {serverStorage.ServerName} ({serverStorage.ServerUri})");
 
-// --- Pick character ---
 if (serverStorage.Authentications.Count == 0)
 {
     Console.WriteLine("No characters configured for this server.");
@@ -82,10 +94,22 @@ if (auth.LastSeenCID == null || auth.LastSeenCID == 0)
 }
 
 var charaIdent = auth.LastSeenCID.Value.ToString().GetHash256();
-logger.LogDebug("charaIdent: {ident}", charaIdent[..10] + "...");
 
-// --- Build connector ---
 var connector = new MareConnector(loggerFactory, serverStorage, auth, charaIdent, config.EnableGatewayDiscovery);
-await connector.RunAsync(cts.Token);
+
+if (hashes.Count > 0)
+{
+    await connector.ConnectAsync(cts.Token);
+    var written = await connector.DownloadFilesAsync(hashes, outputDir, cts.Token);
+    await connector.DisconnectAsync();
+
+    Console.WriteLine($"\nDownloaded {written.Count}/{hashes.Count} file(s) to: {Path.GetFullPath(outputDir)}");
+    foreach (var path in written)
+        Console.WriteLine($"  {path}");
+}
+else
+{
+    await connector.RunAsync(cts.Token);
+}
 
 return 0;

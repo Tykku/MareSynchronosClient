@@ -34,6 +34,7 @@ public class MareConnector
     private HubConnection? _hub;
     private string? _cachedToken;
     private DateTime _tokenValidTo = DateTime.MinValue;
+    private FileDownloader? _fileDownloader;
 
     public MareConnector(ILoggerFactory loggerFactory, ServerStorage server, Authentication auth,
         string charaIdent, bool enableGatewayDiscovery)
@@ -48,35 +49,50 @@ public class MareConnector
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("MareStandaloneClient/1.0");
     }
 
+    public async Task ConnectAsync(CancellationToken ct)
+    {
+        Console.WriteLine("\nResolving gateway...");
+        var hubUrl = await ResolveHubUrlAsync(ct);
+        Console.WriteLine($"Connecting to: {hubUrl}");
+
+        _hub = BuildHubConnection(hubUrl, ct);
+        RegisterHandlers();
+
+        Console.WriteLine("Connecting...");
+        await _hub.StartAsync(ct);
+
+        var connDto = await _hub.InvokeAsync<ConnectionDto>("GetConnectionDto", ct);
+        _fileDownloader = new FileDownloader(_loggerFactory, connDto.ServerInfo.FileServerAddress, GetOrUpdateTokenAsync);
+        Console.WriteLine("Connected!");
+        Console.WriteLine($"  UID          : {connDto.User.AliasOrUID}");
+        Console.WriteLine($"  CDN          : {connDto.ServerInfo.FileServerAddress}");
+        Console.WriteLine($"  Server ver   : {connDto.ServerVersion} (API requires {IMareHub.ApiVersion})");
+        Console.WriteLine($"  Client ver   : {connDto.CurrentClientVersion}");
+
+        var healthy = await _hub.InvokeAsync<bool>("CheckClientHealth", ct);
+        if (!healthy)
+            Console.WriteLine("  Health check : outdated client version (connection still works)");
+    }
+
+    public async Task DisconnectAsync()
+    {
+        if (_hub != null)
+        {
+            Console.WriteLine("\nDisconnecting...");
+            await _hub.StopAsync(CancellationToken.None);
+            await _hub.DisposeAsync();
+            _hub = null;
+        }
+        _httpClient.Dispose();
+    }
+
     public async Task RunAsync(CancellationToken ct)
     {
         try
         {
-            Console.WriteLine("\nResolving gateway...");
-            var hubUrl = await ResolveHubUrlAsync(ct);
-            Console.WriteLine($"Connecting to: {hubUrl}");
-
-            _hub = BuildHubConnection(hubUrl, ct);
-            RegisterHandlers();
-
-            Console.WriteLine("Connecting...");
-            await _hub.StartAsync(ct);
-
-            var connDto = await _hub.InvokeAsync<ConnectionDto>("GetConnectionDto", ct);
-            Console.WriteLine($"Connected!");
-            Console.WriteLine($"  UID          : {connDto.User.AliasOrUID}");
-            Console.WriteLine($"  Server ver   : {connDto.ServerVersion} (API requires {IMareHub.ApiVersion})");
-            Console.WriteLine($"  Client ver   : {connDto.CurrentClientVersion}");
-
-            var healthy = await _hub.InvokeAsync<bool>("CheckClientHealth", ct);
-            if (!healthy)
-                Console.WriteLine("  Health check : outdated client version (connection still works)");
-
+            await ConnectAsync(ct);
             Console.WriteLine("\nPress Ctrl+C to disconnect.\n");
-
-            // Keep alive until cancelled
-            try { await Task.Delay(Timeout.Infinite, ct); }
-            catch (OperationCanceledException) { }
+            await HealthCheckLoopAsync(ct);
         }
         catch (OperationCanceledException)
         {
@@ -89,13 +105,7 @@ public class MareConnector
         }
         finally
         {
-            if (_hub != null)
-            {
-                Console.WriteLine("\nDisconnecting...");
-                await _hub.StopAsync(CancellationToken.None);
-                await _hub.DisposeAsync();
-            }
-            _httpClient.Dispose();
+            await DisconnectAsync();
         }
     }
 
@@ -225,6 +235,50 @@ public class MareConnector
         };
     }
 
+    public Task<List<string>> DownloadFilesAsync(IReadOnlyList<string> hashes, string outputDir, CancellationToken ct)
+    {
+        if (_fileDownloader == null)
+            throw new InvalidOperationException("Not connected yet — call RunAsync first.");
+        return _fileDownloader.DownloadAsync(hashes, outputDir, ct);
+    }
+
+    private async Task HealthCheckLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && _hub != null)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            _logger.LogDebug("Refreshing token and checking health");
+
+            // Refresh token — if expired and renewal fails, reconnect
+            try
+            {
+                await GetOrUpdateTokenAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Token refresh failed, stopping health loop");
+                break;
+            }
+
+            try
+            {
+                _ = await _hub.InvokeAsync<bool>("CheckClientHealth", ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Health check invocation failed");
+            }
+        }
+    }
+
     private async Task<string?> GetOrUpdateTokenAsync(CancellationToken ct)
     {
         if (_cachedToken != null && _tokenValidTo.Subtract(TimeSpan.FromMinutes(5)) > DateTime.UtcNow)
@@ -301,20 +355,17 @@ public class MareConnector
 
     private static bool IsWine()
     {
-        // Heuristic: WINE sets WINEPREFIX or the ntdll module path differs
         return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WINEPREFIX"))
             || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WINEDLLPATH"));
     }
 }
 
-/// <summary>Reconnects forever, like the plugin does.</summary>
 file sealed class ForeverRetry : IRetryPolicy
 {
     public TimeSpan? NextRetryDelay(RetryContext retryContext) =>
         TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, retryContext.PreviousRetryCount)));
 }
 
-/// <summary>Bridges ILoggerFactory to ILoggerProvider for SignalR's ConfigureLogging.</summary>
 file sealed class LoggerFactoryProvider(ILoggerFactory factory) : ILoggerProvider
 {
     public ILogger CreateLogger(string categoryName) => factory.CreateLogger(categoryName);
