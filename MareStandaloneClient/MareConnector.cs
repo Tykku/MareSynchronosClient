@@ -1,4 +1,3 @@
-using DnsClient;
 using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.API.Dto;
@@ -14,10 +13,8 @@ using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Diagnostics;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net.Http.Headers;
-using System.Text.Json;
 
 namespace MareStandaloneClient;
 
@@ -30,6 +27,7 @@ public class MareConnector
     private readonly string _charaIdent;
     private readonly bool _enableGatewayDiscovery;
     private readonly HttpClient _httpClient;
+    private readonly Action<string> _log;
 
     private HubConnection? _hub;
     private string? _cachedToken;
@@ -37,7 +35,7 @@ public class MareConnector
     private FileDownloader? _fileDownloader;
 
     public MareConnector(ILoggerFactory loggerFactory, ServerStorage server, Authentication auth,
-        string charaIdent, bool enableGatewayDiscovery)
+        string charaIdent, bool enableGatewayDiscovery, Action<string> log)
     {
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<MareConnector>();
@@ -45,40 +43,41 @@ public class MareConnector
         _auth = auth;
         _charaIdent = charaIdent;
         _enableGatewayDiscovery = enableGatewayDiscovery;
+        _log = log;
         _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("MareStandaloneClient/1.0");
     }
 
     public async Task ConnectAsync(CancellationToken ct)
     {
-        Console.WriteLine("\nResolving gateway...");
+        _log("Resolving gateway...");
         var hubUrl = await ResolveHubUrlAsync(ct);
-        Console.WriteLine($"Connecting to: {hubUrl}");
+        _log($"Connecting to: {hubUrl}");
 
         _hub = BuildHubConnection(hubUrl, ct);
         RegisterHandlers();
 
-        Console.WriteLine("Connecting...");
+        _log("Connecting...");
         await _hub.StartAsync(ct);
 
         var connDto = await _hub.InvokeAsync<ConnectionDto>("GetConnectionDto", ct);
         _fileDownloader = new FileDownloader(_loggerFactory, connDto.ServerInfo.FileServerAddress, GetOrUpdateTokenAsync);
-        Console.WriteLine("Connected!");
-        Console.WriteLine($"  UID          : {connDto.User.AliasOrUID}");
-        Console.WriteLine($"  CDN          : {connDto.ServerInfo.FileServerAddress}");
-        Console.WriteLine($"  Server ver   : {connDto.ServerVersion} (API requires {IMareHub.ApiVersion})");
-        Console.WriteLine($"  Client ver   : {connDto.CurrentClientVersion}");
+        _log("Connected!");
+        _log($"  UID          : {connDto.User.AliasOrUID}");
+        _log($"  CDN          : {connDto.ServerInfo.FileServerAddress}");
+        _log($"  Server ver   : {connDto.ServerVersion} (API requires {IMareHub.ApiVersion})");
+        _log($"  Client ver   : {connDto.CurrentClientVersion}");
 
         var healthy = await _hub.InvokeAsync<bool>("CheckClientHealth", ct);
         if (!healthy)
-            Console.WriteLine("  Health check : outdated client version (connection still works)");
+            _log("  Health check : outdated client version (connection still works)");
     }
 
     public async Task DisconnectAsync()
     {
         if (_hub != null)
         {
-            Console.WriteLine("\nDisconnecting...");
+            _log("Disconnecting...");
             await _hub.StopAsync(CancellationToken.None);
             await _hub.DisposeAsync();
             _hub = null;
@@ -91,17 +90,17 @@ public class MareConnector
         try
         {
             await ConnectAsync(ct);
-            Console.WriteLine("\nPress Ctrl+C to disconnect.\n");
+            _log("Listening for server events. Use Disconnect to stop.");
             await HealthCheckLoopAsync(ct);
         }
         catch (OperationCanceledException)
         {
-            // expected on Ctrl+C
+            // expected on disconnect
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Connection failed");
-            Console.WriteLine($"\nError: {ex.Message}");
+            _log($"Error: {ex.Message}");
         }
         finally
         {
@@ -179,10 +178,10 @@ public class MareConnector
     private void RegisterHandlers()
     {
         _hub!.On<SystemInfoDto>(nameof(IMareHub.Client_UpdateSystemInfo), info =>
-            Console.WriteLine($"[Server] Online users: {info.OnlineUsers}"));
+            _log($"[Server] Online users: {info.OnlineUsers}"));
 
         _hub!.On<MessageSeverity, string>(nameof(IMareHub.Client_ReceiveServerMessage), (severity, msg) =>
-            Console.WriteLine($"[Server Message ({severity})] {msg}"));
+            _log($"[Server Message ({severity})] {msg}"));
 
         // Stub handlers to suppress "no handler" warnings for server-pushed events we don't act on
         _hub!.On<GroupPermissionDto>(nameof(IMareHub.Client_GroupChangePermissions), _ => { });
@@ -220,25 +219,27 @@ public class MareConnector
 
         _hub!.Closed += ex =>
         {
-            Console.WriteLine($"[Connection closed] {ex?.Message ?? "clean shutdown"}");
+            _log($"[Connection closed] {ex?.Message ?? "clean shutdown"}");
             return Task.CompletedTask;
         };
         _hub!.Reconnecting += ex =>
         {
-            Console.WriteLine($"[Reconnecting] {ex?.Message}");
+            _log($"[Reconnecting] {ex?.Message}");
             return Task.CompletedTask;
         };
         _hub!.Reconnected += id =>
         {
-            Console.WriteLine($"[Reconnected] ConnectionId: {id}");
+            _log($"[Reconnected] ConnectionId: {id}");
             return Task.CompletedTask;
         };
     }
 
+    public Task ListenAsync(CancellationToken ct) => HealthCheckLoopAsync(ct);
+
     public Task<List<string>> DownloadFilesAsync(IReadOnlyList<string> hashes, string outputDir, CancellationToken ct)
     {
         if (_fileDownloader == null)
-            throw new InvalidOperationException("Not connected yet — call RunAsync first.");
+            throw new InvalidOperationException("Not connected yet — call ConnectAsync first.");
         return _fileDownloader.DownloadAsync(hashes, outputDir, ct);
     }
 
@@ -257,7 +258,6 @@ public class MareConnector
 
             _logger.LogDebug("Refreshing token and checking health");
 
-            // Refresh token — if expired and renewal fails, reconnect
             try
             {
                 await GetOrUpdateTokenAsync(ct);
@@ -292,9 +292,8 @@ public class MareConnector
         if (_server.UseOAuth2)
         {
             if (string.IsNullOrEmpty(_server.OAuthToken) || string.IsNullOrEmpty(_auth.UID))
-            {
                 throw new InvalidOperationException("Server uses OAuth2 but OAuthToken or UID is missing.");
-            }
+
             var uri = MareAuth.AuthWithOauthFullPath(new Uri(authBase));
             var req = new HttpRequestMessage(HttpMethod.Post, uri)
             {
@@ -332,7 +331,7 @@ public class MareConnector
         _cachedToken = token;
 
         var uid = jwt.Claims.FirstOrDefault(c => c.Type == "uid")?.Value ?? "unknown";
-        Console.WriteLine($"Authenticated! UID: {uid}, Token valid until: {_tokenValidTo:u}");
+        _log($"Authenticated! UID: {uid}, Token valid until: {_tokenValidTo:u}");
 
         return token;
     }

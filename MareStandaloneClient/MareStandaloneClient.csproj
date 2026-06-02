@@ -1,14 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net9.0-windows</TargetFramework>
     <AssemblyName>MareStandaloneClient</AssemblyName>
     <RootNamespace>MareStandaloneClient</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <UseWPF>true</UseWPF>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="System.IO"/>
+    <Using Include="System.Net.Http"/>
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\MareAPI\MareSynchronosAPI\MareSynchronos.API.csproj" />
